@@ -47,7 +47,7 @@ jobs:
 ## build
 
 Builds and pushes `ghcr.io/<owner>/<repo>[/<image>]`, lower-cased, tagged
-`sha-<sha>` and `latest`. It outputs `digest` (bare `sha256:...`) and `ref`
+`sha-<sha>`, `latest` and any extra `tags`. It outputs `digest` (bare `sha256:...`) and `ref`
 (`ghcr.io/...@sha256:...`), and writes the same pin line to the job summary.
 
 | Input | Required | Default | Meaning |
@@ -56,6 +56,8 @@ Builds and pushes `ghcr.io/<owner>/<repo>[/<image>]`, lower-cased, tagged
 | `context` | no | `.` | build context directory |
 | `dockerfile` | no | `Dockerfile` | Dockerfile path, relative to `context` (joined as `<context>/<dockerfile>`) |
 | `image` | no | empty | sub-name: publish `ghcr.io/<owner>/<repo>/<image>` |
+| `ref` | no | empty → triggering commit | git ref to check out and build; `sha-<sha>` names that commit |
+| `tags` | no | empty | extra image tags, newline-separated (e.g. `v1.2.3`) |
 
 The called workflow requests `packages: write`, but a reusable workflow can only
 narrow the caller's token, so the calling job must grant it.
@@ -91,6 +93,28 @@ jobs:
 ```
 
 The `ref` output and the "Image digest — pin this" summary line are the same immutable reference.
+
+Release images: a tag or release created with `GITHUB_TOKEN` triggers no
+workflow, so the release workflow calls `build` in the same run, gated on its
+own output, and builds the tag it just pushed:
+
+```yaml
+jobs:
+  release:
+    uses: astrojones/.github/.github/workflows/release.yml@main
+    # ...
+  image:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: bartixcloud/workflows/.github/workflows/build.yml@v1
+    with:
+      runs-on: '["self-hosted","<tenant>","build"]'
+      ref: ${{ needs.release.outputs.tag }}
+      tags: ${{ needs.release.outputs.tag }}
+```
 
 ## Runner labels
 

@@ -1,7 +1,8 @@
 name: build (reusable)
 
 # Builds the repo's container image and pushes it to GitHub Container Registry as
-# `ghcr.io/<owner>/<repo>[:/<image>]` with tags `sha-<commit>` and `latest`, then
+# `ghcr.io/<owner>/<repo>[:/<image>]` with tags `sha-<commit>`, `latest` and any
+# caller-supplied `tags` (e.g. a release `v1.2.3`), then
 # surfaces the immutable `sha256:...` digest as a workflow output.
 #
 # CI only — there is no deploy job here. Deploying is a separate act: pin the
@@ -45,6 +46,19 @@ on:
         type: string
         required: false
         default: ""
+      # A release job that pushed a version-bump commit + tag with GITHUB_TOKEN
+      # triggers nothing, so it calls this in the same run and must build the
+      # tag, not the pre-bump `github.sha`.
+      ref:
+        description: "Git ref to check out and build (empty = the triggering commit)"
+        type: string
+        required: false
+        default: ""
+      tags:
+        description: "Extra image tags, newline-separated (e.g. a release tag `v1.2.3`)"
+        type: string
+        required: false
+        default: ""
     outputs:
       digest:
         description: "Bare sha256:... digest of the pushed image (pin this)"
@@ -65,15 +79,18 @@ jobs:
       ref: ${{ format('{0}@{1}', steps.resolve.outputs.ref-prefix, steps.build.outputs.digest) }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       # OCI requires a lower-case repository path, but `github.repository` keeps
       # the owner's casing. Caller inputs arrive via env, never interpolated into
-      # the script, so a crafted `image` value cannot execute here.
+      # the script, so a crafted `image` or `tags` value cannot execute here.
       - name: Resolve image ref
         id: resolve
         env:
           REPOSITORY: ${{ github.repository }}
           IMAGE_SUBNAME: ${{ inputs.image }}
+          EXTRA_TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
           repository="${REPOSITORY,,}"
@@ -82,8 +99,24 @@ jobs:
           if [ -n "$subname" ]; then
             image="${image}/${subname}"
           fi
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
-          echo "ref-prefix=${image}" >> "$GITHUB_OUTPUT"
+          # HEAD, not github.sha: with `ref` set they differ, and sha-<commit>
+          # must name what was actually built.
+          tags="${image}:latest"$'\n'"${image}:sha-$(git rev-parse HEAD)"
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            if ! [[ "$t" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::invalid image tag '${t}'" >&2
+              exit 1
+            fi
+            tags+=$'\n'"${image}:${t}"
+          done <<< "$EXTRA_TAGS"
+          {
+            echo "image=${image}"
+            echo "ref-prefix=${image}"
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -101,9 +134,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.context }}/${{ inputs.dockerfile }}
           push: true
-          tags: |
-            ${{ steps.resolve.outputs.image }}:latest
-            ${{ steps.resolve.outputs.image }}:sha-${{ github.sha }}
+          tags: ${{ steps.resolve.outputs.tags }}
 
       - name: Digest to pin in <tenant>/infra
         env:
