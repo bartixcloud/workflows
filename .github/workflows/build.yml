@@ -31,8 +31,10 @@ on:
         type: string
         required: false
         default: "."
+      # `file:` on build-push-action resolves against the workspace root, not
+      # against `context`, so the two are joined explicitly below.
       dockerfile:
-        description: "Dockerfile path, relative to the context"
+        description: "Dockerfile path, relative to `context` (joined as `<context>/<dockerfile>`)"
         type: string
         required: false
         default: "Dockerfile"
@@ -97,7 +99,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.context }}
-          file: ${{ inputs.dockerfile }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
           push: true
           tags: |
             ${{ steps.resolve.outputs.image }}:latest

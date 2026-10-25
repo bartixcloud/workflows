@@ -54,7 +54,7 @@ Builds and pushes `ghcr.io/<owner>/<repo>[/<image>]`, lower-cased, tagged
 | --- | --- | --- | --- |
 | `runs-on` | yes | — | JSON array of runner labels |
 | `context` | no | `.` | build context directory |
-| `dockerfile` | no | `Dockerfile` | Dockerfile path, relative to `context` |
+| `dockerfile` | no | `Dockerfile` | Dockerfile path, relative to `context` (joined as `<context>/<dockerfile>`) |
 | `image` | no | empty | sub-name: publish `ghcr.io/<owner>/<repo>/<image>` |
 
 The called workflow requests `packages: write`, but a reusable workflow can only
