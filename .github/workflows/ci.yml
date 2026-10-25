@@ -9,11 +9,10 @@ name: ci (reusable)
 #       branches: [main]
 #   jobs:
 #     ci:
-#       uses: astrojones/bartixcloud-workflows/.github/workflows/ci.yml@main
+#       uses: bartixcloud/workflows/.github/workflows/ci.yml@v1
 #       with:
 #         runs-on: '["self-hosted","<tenant>","build"]'
 #         language: python   # python | node
-#         python-version: "" # optional — empty falls back to .python-version
 #
 # It produces a single `ci` job that is meant to be the required status check on
 # main — which both enforces the baseline and makes release-PR auto-merge valid.
