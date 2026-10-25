@@ -1,0 +1,120 @@
+name: build (reusable)
+
+# Builds the repo's container image and pushes it to GitHub Container Registry as
+# `ghcr.io/<owner>/<repo>[:/<image>]` with tags `sha-<commit>` and `latest`, then
+# surfaces the immutable `sha256:...` digest as a workflow output.
+#
+# CI only — there is no deploy job here. Deploying is a separate act: pin the
+# digest (the `ref` output / the line in the step summary) in `<tenant>/infra`.
+# `latest` is a convenience pointer, never a deployment pin.
+#
+# Runners come from the caller so every tenant stays on its own self-hosted pool:
+# `["self-hosted","<tenant>","build"]` — the `<tenant>` label scopes the queue to
+# that tenant's build VM, `build` marks the tier.
+#
+# INTENDED MOVE (spec D11/G19): once zot exists, the registry host becomes
+# `registry.bartix.de/<tenant>/...` instead of `ghcr.io/<owner>/<repo>[/<image>]`.
+# Kept on ghcr.io for now so callers deploy today; the push/ref shape stays the
+# same, only the host and path prefix change.
+
+on:
+  workflow_call:
+    inputs:
+      # JSON array string → fromJSON below. Required: a caller may not silently
+      # inherit a default pool.
+      runs-on:
+        description: 'JSON array of runner labels, e.g. ''["self-hosted","<tenant>","build"]'''
+        type: string
+        required: true
+      context:
+        description: "Build context directory"
+        type: string
+        required: false
+        default: "."
+      dockerfile:
+        description: "Dockerfile path, relative to the context"
+        type: string
+        required: false
+        default: "Dockerfile"
+      # Optional sub-name: set it to publish `ghcr.io/<owner>/<repo>/<image>`,
+      # e.g. one repo building several images.
+      image:
+        description: "Optional image sub-name (empty = ghcr.io/<owner>/<repo>)"
+        type: string
+        required: false
+        default: ""
+    outputs:
+      digest:
+        description: "Bare sha256:... digest of the pushed image (pin this)"
+        value: ${{ jobs.build.outputs.digest }}
+      ref:
+        description: "Fully resolved, pinnable image ref: ghcr.io/...@sha256:..."
+        value: ${{ jobs.build.outputs.ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      ref: ${{ format('{0}@{1}', steps.resolve.outputs.ref-prefix, steps.build.outputs.digest) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # OCI requires a lower-case repository path, but `github.repository` keeps
+      # the owner's casing. Caller inputs arrive via env, never interpolated into
+      # the script, so a crafted `image` value cannot execute here.
+      - name: Resolve image ref
+        id: resolve
+        env:
+          REPOSITORY: ${{ github.repository }}
+          IMAGE_SUBNAME: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          repository="${REPOSITORY,,}"
+          subname="${IMAGE_SUBNAME,,}"
+          image="ghcr.io/${repository}"
+          if [ -n "$subname" ]; then
+            image="${image}/${subname}"
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "ref-prefix=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.resolve.outputs.image }}:latest
+            ${{ steps.resolve.outputs.image }}:sha-${{ github.sha }}
+
+      - name: Digest to pin in <tenant>/infra
+        env:
+          REF_PREFIX: ${{ steps.resolve.outputs.ref-prefix }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Image digest — pin this in \`<tenant>/infra\`"
+            echo
+            echo '```'
+            echo "${REF_PREFIX}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Deploy by pinning the digest above; \`latest\` is not a pin."
+          } >> "$GITHUB_STEP_SUMMARY"
