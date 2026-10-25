@@ -1,0 +1,107 @@
+name: ci (reusable)
+
+# Org-wide minimum CI standard. Each repo calls this on PR + push to main:
+#
+#   name: ci
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   jobs:
+#     ci:
+#       uses: astrojones/bartixcloud-workflows/.github/workflows/ci.yml@main
+#       with:
+#         runs-on: '["self-hosted","<tenant>","build"]'
+#         language: python   # python | node
+#         python-version: "" # optional — empty falls back to .python-version
+#
+# It produces a single `ci` job that is meant to be the required status check on
+# main — which both enforces the baseline and makes release-PR auto-merge valid.
+#
+# Philosophy: lint + format + test where they exist, fail loudly on real
+# failures, and stay a trivial green for content-only repos. Steps self-skip
+# when their tooling/config isn't present, so one workflow fits every repo.
+
+on:
+  workflow_call:
+    inputs:
+      # Runners come from the caller so every tenant stays on its own
+      # self-hosted pool. JSON array string → fromJSON below.
+      runs-on:
+        description: 'JSON array of runner labels, e.g. ''["self-hosted","<tenant>","build"]'''
+        type: string
+        required: true
+      language:
+        description: "python (node follows later)"
+        type: string
+        required: true
+      # Empty → setup-uv falls back to the repo's .python-version.
+      python-version:
+        description: "python: version to install (empty = .python-version)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # Single job name = the single required status check.
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # ---- Python: ruff lint + format check, ty + pytest when present --------
+      - name: Set up uv
+        if: ${{ inputs.language == 'python' }}
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          set -euo pipefail
+          uv sync --locked --all-groups
+
+      - name: Ruff lint
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          set -euo pipefail
+          uv run ruff check .
+
+      - name: Ruff format check
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          set -euo pipefail
+          uv run ruff format --check .
+
+      # Detect optional tools from the lockfile so a repo that doesn't use them
+      # stays green without opting in via extra inputs. No uv.lock → not present.
+      - name: Detect optional tooling
+        if: ${{ inputs.language == 'python' }}
+        id: tooling
+        run: |
+          set -euo pipefail
+          if [ -f uv.lock ] && grep -qF 'name = "ty"' uv.lock; then
+            echo "ty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ty type check
+        if: ${{ inputs.language == 'python' && steps.tooling.outputs.ty == 'true' }}
+        run: |
+          set -euo pipefail
+          uv run ty check
+
+      - name: Pytest (only if a test suite is present)
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          set -euo pipefail
+          if [ -d tests ]; then
+            uv run pytest
+          else
+            echo "no tests/ directory — skipping"
+          fi
