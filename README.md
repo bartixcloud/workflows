@@ -7,6 +7,7 @@ nothing tenant-specific, secret or internal belongs in here.
 | --- | --- |
 | `.github/workflows/ci.yml` | one required `ci` check: lint, format, type check, tests |
 | `.github/workflows/build.yml` | build the repo image, push to ghcr.io, expose its digest |
+| `.github/workflows/checks.yml` | run a caller-defined list of check commands with uv or pnpm set up, optionally beside a throwaway Postgres |
 
 Consume them by tag (`@v1`); breaking changes get a new major tag.
 
@@ -142,3 +143,42 @@ convenience pointer and is never a deployment pin.
 
 Registry: once zot exists, the registry moves from `ghcr.io/<owner>/<repo>` to
 `registry.bartix.de/<tenant>/...`; only host and path prefix change.
+
+## checks
+
+`ci` is the baseline for a plain repo. `checks` is for a repo whose checks are its
+own: a monorepo with a backend and a frontend, generated-artifact drift checks,
+migrations against a real database. The caller lists the commands; the workflow
+sets up the toolchain, starts a throwaway Postgres when asked, runs the commands
+with `bash -euo pipefail` (the first failure fails the job) and removes the
+container afterwards. One call is one job, so a backend and a frontend are two calls.
+
+| Input | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `runs-on` | yes | — | JSON array of runner labels |
+| `toolchain` | yes | — | `python` (uv), `node` (pnpm) or `none` |
+| `commands` | yes | — | script run in `working-directory` |
+| `working-directory` | no | `.` | where install and commands run |
+| `python-version` | no | empty → `.python-version` | |
+| `node-version` | no | empty → the runner image's node | |
+| `install` | no | `uv sync --locked` / `pnpm install --frozen-lockfile` | |
+| `env` | no | empty | extra `KEY=VALUE` lines for the commands |
+| `postgres` | no | `false` | start Postgres; commands see `POSTGRES_PORT` (user `postgres`, password `test`, database `test`, `127.0.0.1` only) |
+| `postgres-image` | no | `postgres:16-alpine` | |
+
+The Postgres needs Docker on the runner; the `build` tier image ships it.
+
+```yaml
+jobs:
+  backend:
+    uses: bartixcloud/workflows/.github/workflows/checks.yml@v1
+    with:
+      runs-on: '["self-hosted","<tenant>","build"]'
+      toolchain: python
+      working-directory: backend
+      postgres: true
+      commands: |
+        uv run ruff check .
+        uv run pytest
+        DATABASE_URL="postgresql+asyncpg://postgres:test@127.0.0.1:${POSTGRES_PORT}/test" uv run alembic upgrade head
+```

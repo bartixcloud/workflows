@@ -1,0 +1,165 @@
+name: checks (reusable)
+
+# Run a caller-defined list of check commands with a toolchain set up, optionally
+# beside a throwaway Postgres. Nothing app-specific lives here: the caller owns
+# WHICH checks run (lint, types, tests, generated-artifact drift, migrations); this
+# workflow owns HOW they run on a tenant's broker VM (toolchain, database,
+# cleanup). One job per call, so a repo with a backend and a frontend calls it twice.
+#
+#   jobs:
+#     backend:
+#       uses: bartixcloud/workflows/.github/workflows/checks.yml@v1
+#       with:
+#         runs-on: '["self-hosted","<tenant>","build"]'
+#         toolchain: python
+#         working-directory: backend
+#         postgres: true
+#         commands: |
+#           uv run ruff check .
+#           uv run pytest
+#           DATABASE_URL="postgresql+asyncpg://postgres:test@127.0.0.1:${POSTGRES_PORT}/test" uv run alembic upgrade head
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'JSON array of runner labels, e.g. ''["self-hosted","<tenant>","build"]'''
+        type: string
+        required: true
+      toolchain:
+        description: "python (uv) | node (pnpm) | none"
+        type: string
+        required: true
+      working-directory:
+        description: "Directory the install and the commands run in"
+        type: string
+        required: false
+        default: "."
+      python-version:
+        description: "python: version for setup-uv (empty = .python-version)"
+        type: string
+        required: false
+        default: ""
+      node-version:
+        description: "node: version for setup-node (empty = whatever the runner image ships)"
+        type: string
+        required: false
+        default: ""
+      install:
+        description: "Install command (empty = 'uv sync --locked' for python, 'pnpm install --frozen-lockfile' for node)"
+        type: string
+        required: false
+        default: ""
+      commands:
+        description: "Shell script run with 'bash -euo pipefail' in working-directory; the first failing command fails the job"
+        type: string
+        required: true
+      env:
+        description: "Extra environment for the commands, one KEY=VALUE per line (single-line values)"
+        type: string
+        required: false
+        default: ""
+      postgres:
+        description: "Start a throwaway Postgres; commands see POSTGRES_PORT (user postgres, password test, database test, bound to 127.0.0.1)"
+        type: boolean
+        required: false
+        default: false
+      postgres-image:
+        description: "Image for the throwaway Postgres"
+        type: string
+        required: false
+        default: "postgres:16-alpine"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        if: ${{ inputs.toolchain == 'python' }}
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Set up pnpm
+        if: ${{ inputs.toolchain == 'node' }}
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Set up node
+        if: ${{ inputs.toolchain == 'node' && inputs.node-version != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        if: ${{ inputs.toolchain != 'none' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          INSTALL: ${{ inputs.install }}
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          if [ -z "$INSTALL" ]; then
+            case "$TOOLCHAIN" in
+              python) INSTALL="uv sync --locked" ;;
+              node)   INSTALL="pnpm install --frozen-lockfile" ;;
+            esac
+          fi
+          bash -euo pipefail -c "$INSTALL"
+
+      - name: Export extra environment
+        if: ${{ inputs.env != '' }}
+        env:
+          EXTRA_ENV: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if ! printf '%s' "$line" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.*$'; then
+              echo "env input: not KEY=VALUE: ${line%%=*}" >&2
+              exit 1
+            fi
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$EXTRA_ENV"
+
+      - name: Start postgres
+        if: ${{ inputs.postgres }}
+        env:
+          PG_IMAGE: ${{ inputs.postgres-image }}
+        run: |
+          set -euo pipefail
+          name="ci-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          docker run -d --name "$name" \
+            -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test \
+            -p 127.0.0.1::5432 \
+            --health-cmd "pg_isready -U postgres" --health-interval 2s \
+            --health-timeout 5s --health-retries 30 \
+            "$PG_IMAGE" > /dev/null
+          echo "POSTGRES_CONTAINER=$name" >> "$GITHUB_ENV"
+          for _ in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy ]; then
+              port="$(docker port "$name" 5432/tcp | head -n1 | awk -F: '{print $NF}')"
+              echo "POSTGRES_PORT=$port" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres did not become healthy" >&2
+          docker logs "$name" >&2 || true
+          exit 1
+
+      - name: Run checks
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          CHECK_COMMANDS: ${{ inputs.commands }}
+        run: bash -euo pipefail -c "$CHECK_COMMANDS"
+
+      - name: Stop postgres
+        if: ${{ always() && inputs.postgres }}
+        run: docker rm -f "${POSTGRES_CONTAINER:-none}" > /dev/null 2>&1 || true
