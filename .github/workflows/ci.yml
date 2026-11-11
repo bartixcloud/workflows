@@ -54,7 +54,7 @@ jobs:
       # ---- Python: ruff lint + format check, ty + pytest when present --------
       - name: Set up uv
         if: ${{ inputs.language == 'python' }}
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ inputs.python-version }}
 
