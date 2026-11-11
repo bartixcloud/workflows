@@ -27,7 +27,7 @@ on:
         type: string
         required: true
       toolchain:
-        description: "python (uv) | node (pnpm) | none"
+        description: "python (uv) | node (pnpm) | rust (the runner image's pinned rustup toolchain) | none"
         type: string
         required: true
       working-directory:
@@ -46,14 +46,15 @@ on:
         required: false
         default: ""
       install:
-        description: "Install command (empty = 'uv sync --locked' for python, 'pnpm install --frozen-lockfile' for node)"
+        description: "Install command (empty = 'uv sync --locked' for python, 'pnpm install --frozen-lockfile' for node, 'cargo fetch --locked' for rust)"
         type: string
         required: false
         default: ""
       commands:
-        description: "Shell script run with 'bash -euo pipefail' in working-directory; the first failing command fails the job"
+        description: "Shell script run with 'bash -euo pipefail' in working-directory; the first failing command fails the job. Required except for rust, where empty runs cargo fmt --check, cargo clippy --all-targets --locked -- -D warnings and cargo test --locked"
         type: string
-        required: true
+        required: false
+        default: ""
       env:
         description: "Extra environment for the commands, one KEY=VALUE per line (single-line values)"
         type: string
@@ -77,25 +78,73 @@ jobs:
   checks:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     steps:
-      - uses: actions/checkout@v7
+      # Prints the infra tag of the shared runner image (written by the image
+      # build to /etc/bcx-runner-image), or "none" off that image, so a run log
+      # shows which image served it.
+      - name: Runner image marker
+        run: |
+          echo "bcx-runner-image: $(cat /etc/bcx-runner-image 2>/dev/null || echo none)"
+
+      # Fail before any setup work when the inputs cannot work.
+      - name: Validate inputs
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          COMMANDS: ${{ inputs.commands }}
+        run: |
+          set -euo pipefail
+          case "$TOOLCHAIN" in
+            python|node|rust|none) ;;
+            *) echo "::error::toolchain must be python, node, rust or none, got '${TOOLCHAIN}'"; exit 1 ;;
+          esac
+          if [ -z "$COMMANDS" ] && [ "$TOOLCHAIN" != rust ]; then
+            echo "::error::commands is required for toolchain '${TOOLCHAIN}'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
         if: ${{ inputs.toolchain == 'python' }}
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: ${{ inputs.python-version }}
 
       - name: Set up pnpm
         if: ${{ inputs.toolchain == 'node' }}
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           package_json_file: ${{ inputs.working-directory }}/package.json
 
       - name: Set up node
         if: ${{ inputs.toolchain == 'node' && inputs.node-version != '' }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
+
+      # The image pins the toolchain (RUST_VERSION), so nothing is downloaded
+      # here unless the repo asks for another one via rust-toolchain(.toml).
+      - name: Set up rust
+        if: ${{ inputs.toolchain == 'rust' }}
+        id: rust
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null || { echo "::error::rustup not found; toolchain rust needs the shared runner image"; exit 1; }
+          rustup show active-toolchain || rustup toolchain install
+          echo "rustc=$(rustc -V)" >> "$GITHUB_OUTPUT"
+
+      # Ephemeral VMs start cold; without this every job recompiles all dependencies.
+      - name: Cache cargo
+        if: ${{ inputs.toolchain == 'rust' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ inputs.working-directory }}/target
+          key: cargo-${{ runner.os }}-${{ hashFiles(format('{0}/Cargo.lock', inputs.working-directory)) }}-${{ steps.rust.outputs.rustc }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
 
       - name: Install dependencies
         if: ${{ inputs.toolchain != 'none' }}
@@ -109,6 +158,7 @@ jobs:
             case "$TOOLCHAIN" in
               python) INSTALL="uv sync --locked" ;;
               node)   INSTALL="pnpm install --frozen-lockfile" ;;
+              rust)   INSTALL="cargo fetch --locked" ;;
             esac
           fi
           bash -euo pipefail -c "$INSTALL"
@@ -158,7 +208,12 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         env:
           CHECK_COMMANDS: ${{ inputs.commands }}
-        run: bash -euo pipefail -c "$CHECK_COMMANDS"
+        run: |
+          set -euo pipefail
+          if [ -z "$CHECK_COMMANDS" ]; then
+            CHECK_COMMANDS=$'cargo fmt --check\ncargo clippy --all-targets --locked -- -D warnings\ncargo test --locked'
+          fi
+          bash -euo pipefail -c "$CHECK_COMMANDS"
 
       - name: Stop postgres
         if: ${{ always() && inputs.postgres }}
