@@ -1,0 +1,656 @@
+name: deploy
+
+# Reusable deploy workflow for hosts that run the `nuk` CLI. One workflow, one
+# job per `mode` (the other jobs are skipped):
+#
+#   apply    pull the images listed in a compose file, then `nuk apply` a manifest.
+#            For apps whose images were already built and pushed by their own CI.
+#   deploy   build one image from a Dockerfile, push it to GHCR, write the env
+#            files from secrets, then `nuk apply` the manifest.
+#   preview  per-PR ephemeral preview stack, controlled by `preview_action`:
+#              deploy    render a per-PR manifest, apply it (cap enforced),
+#                        upsert a sticky PR comment
+#              teardown  `nuk delete <app>-pr-<n>`, update the sticky comment
+#              cleanup   delete every `<app>-pr-*` whose PR is no longer open
+#
+# The jobs call `nuk` and the docker CLI on the runner, so `runs-on` must name a
+# runner that has them and the docker socket (typically the host the apps run
+# on). It is a required input with no default.
+#
+# GHCR auth: the runner logs in with GITHUB_TOKEN and pulls the images into the
+# shared docker daemon, then runs `nuk apply` in-process. An updated :latest is
+# recreated because its image id changed in the daemon.
+#
+# Caller (the caller's job must grant the permissions the chosen mode needs:
+# apply: contents read + packages read; deploy: contents read + packages write;
+# preview: contents read + packages read + pull-requests write + actions read):
+#
+#   jobs:
+#     deploy:
+#       permissions:
+#         contents: read
+#         packages: read
+#       uses: bartixcloud/workflows/.github/workflows/deploy.yml@<40-char SHA> # vX.Y.Z
+#       with:
+#         mode: apply
+#         runs-on: '["self-hosted","<label>"]'   # required: JSON array
+#         manifest: deployment.yml                # optional
+#         compose_file: docker-compose.yml        # optional
+#       secrets:                                  # mapped by name, optional
+#         APP_ENV: ${{ secrets.APP_ENV }}
+#
+# Conventions:
+#   - the manifest lives at the repo root (a legacy .nuklaut/<manifest> is still found, with a warning)
+#   - mode deploy writes /opt/nuklaut/secrets/<repo>.env from the APP_ENV secret
+#     and /opt/nuklaut/secrets/_shared.env from the SHARED_ENV secret (skipped
+#     when SHARED_ENV is empty)
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "apply | preview | deploy"
+        type: string
+        required: true
+      runs-on:
+        description: JSON array of runner labels, e.g. '["self-hosted","host"]'. Required, no default.
+        type: string
+        required: true
+      manifest:
+        description: Path to the nuk manifest in the caller repo (modes apply and deploy)
+        type: string
+        required: false
+        default: deployment.yml
+      compose_file:
+        description: Compose file (repo-relative) whose images are pre-pulled (mode apply)
+        type: string
+        required: false
+        default: docker-compose.yml
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repo root (mode deploy)
+        type: string
+        required: false
+        default: Dockerfile
+      build_context:
+        description: Docker build context (mode deploy)
+        type: string
+        required: false
+        default: "."
+      preview_action:
+        description: "deploy | teardown | cleanup (mode preview)"
+        type: string
+        required: false
+        default: deploy
+      pr_number:
+        description: "PR number (preview deploy and teardown; ignored for cleanup)"
+        type: string
+        required: false
+        default: ""
+      app:
+        description: "App slug; the deployment name is <app>-pr-<n> (mode preview)"
+        type: string
+        required: false
+        default: ""
+      base_host:
+        description: "Base host; the preview host is pr-<n>.<base_host> (preview deploy)"
+        type: string
+        required: false
+        default: ""
+      images:
+        description: >-
+          JSON object mapping compose service to GHCR image ref (no tag), so the
+          runner can pre-pull the pr-<n> tags into the shared daemon (preview deploy).
+          Example: {"backend":"ghcr.io/<owner>/<repo>/backend"}
+        type: string
+        required: false
+        default: "{}"
+      preview_compose_file:
+        description: "Preview compose file in the caller repo (no container_name, no traefik.* labels)"
+        type: string
+        required: false
+        default: docker-compose.pr.yml
+      manifest_template:
+        description: >-
+          Optional path to a templated nuk manifest in the caller repo. The tokens
+          __NAME__, __HOST__ and __COMPOSE_FILE__ are substituted. If empty, a
+          manifest is generated inline (backend at /api with prefix strip, frontend at /).
+        type: string
+        required: false
+        default: ""
+      backend_service:
+        description: "Compose service routed at /api (inline manifest only)"
+        type: string
+        required: false
+        default: backend
+      backend_port:
+        description: "Backend container port (inline manifest only)"
+        type: string
+        required: false
+        default: "8000"
+      frontend_service:
+        description: "Compose service routed at / (inline manifest only)"
+        type: string
+        required: false
+        default: frontend
+      frontend_port:
+        description: "Frontend container port (inline manifest only)"
+        type: string
+        required: false
+        default: "80"
+      max_previews:
+        description: "Max concurrent <app>-pr-* previews"
+        type: number
+        required: false
+        default: 2
+      comment:
+        description: "Upsert a sticky PR comment with the preview URL and status"
+        type: boolean
+        required: false
+        default: true
+      comment_extra:
+        description: "Markdown appended to the preview comment (for example test logins)"
+        type: string
+        required: false
+        default: ""
+    secrets:
+      APP_ENV:
+        description: Per-app secrets as a multiline key=value env file (mode deploy)
+        required: false
+      SHARED_ENV:
+        description: Shared secrets as a multiline key=value env file (mode deploy)
+        required: false
+
+jobs:
+  validate:
+    if: ${{ !contains(fromJSON('["apply","preview","deploy"]'), inputs.mode) }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    steps:
+      - name: Reject unknown mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          echo "::error::mode must be apply, preview or deploy (got '$MODE')"
+          exit 1
+
+  # ── APPLY ──────────────────────────────────────────────────────────────────
+  apply:
+    if: inputs.mode == 'apply'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Runner image marker
+        run: |
+          if [ -r /etc/bcx-runner-image ]; then
+            echo "bcx-runner-image: $(cat /etc/bcx-runner-image)"
+          else
+            echo "bcx-runner-image: none"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify manifest exists
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          { [ -f "$MANIFEST" ] || [ -f ".nuklaut/$MANIFEST" ]; } \
+            || { echo "::error::manifest $MANIFEST not found (checked repo root and legacy .nuklaut/)"; exit 1; }
+          [ -f "$MANIFEST" ] || echo "::warning::Using legacy .nuklaut/$MANIFEST, move it to the repo root ($MANIFEST)."
+
+      # Login and pull as the RUNNER (no sudo) so private images land in the
+      # shared daemon. The deploy user reuses them without needing GHCR creds.
+      - name: Pull images into the shared docker daemon
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          COMPOSE_FILE: ${{ inputs.compose_file }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          # Enumerate images straight from the compose FILE, NOT via
+          # `docker compose config --images`: that resolves each service's
+          # env_file:, so it fails for the runner user whenever a compose file
+          # references a deploy-owned 0600 secret, and swallowing that error
+          # pulls nothing and leaves a stale :latest. Parse the raw YAML instead
+          # (the runner can always read the repo checkout).
+          mapfile -t images < <(grep -oE '^[[:space:]]*image:[[:space:]]*[^[:space:]#]+' "$COMPOSE_FILE" | awk '{print $2}' | sort -u)
+          if [ "${#images[@]}" -eq 0 ]; then
+            echo "::warning::no image: entries in $COMPOSE_FILE, nothing to pull"
+            exit 0
+          fi
+          echo "Pulling images:"; printf '  %s\n' "${images[@]}"
+          printf '%s\n' "${images[@]}" | xargs -n1 docker pull
+
+      # apply: write state, the Traefik dynamic file and the edge override, then
+      # up -d. The images are already in the daemon, so nothing is pulled as the
+      # deploy user.
+      - name: nuk apply
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          /usr/local/bin/nuk apply \
+            --repo-path "$GITHUB_WORKSPACE" \
+            "$MANIFEST"
+
+      - name: Show deployment state
+        run: /usr/local/bin/nuk list
+
+  # ── DEPLOY (build, push, apply) ────────────────────────────────────────────
+  deploy:
+    if: inputs.mode == 'deploy'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Runner image marker
+        run: |
+          if [ -r /etc/bcx-runner-image ]; then
+            echo "bcx-runner-image: $(cat /etc/bcx-runner-image)"
+          else
+            echo "bcx-runner-image: none"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify manifest exists
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          if [ ! -f "$MANIFEST" ] && [ ! -f ".nuklaut/$MANIFEST" ]; then
+            echo "::error::Missing $MANIFEST (checked repo root and legacy .nuklaut/)."
+            exit 1
+          fi
+          [ -f "$MANIFEST" ] || echo "::warning::Using legacy .nuklaut/$MANIFEST, move it to the repo root ($MANIFEST)."
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Build image
+        env:
+          IMG: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+          SHA: ${{ github.sha }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.build_context }}
+        run: |
+          img="$(printf '%s' "$IMG" | tr '[:upper:]' '[:lower:]')"
+          docker build \
+            -t "$img:$SHA" \
+            -t "$img:latest" \
+            -f "$DOCKERFILE" \
+            "$CONTEXT"
+
+      - name: Push image
+        env:
+          IMG: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+        run: docker push --all-tags "$(printf '%s' "$IMG" | tr '[:upper:]' '[:lower:]')"
+
+      # Writes the per-app env file from the APP_ENV secret. An empty file is
+      # created if the secret is absent; nuk still references it via
+      # envFrom.secretRef, which is harmless.
+      - name: Write per-app env file
+        env:
+          REPO: ${{ github.event.repository.name }}
+          APP_ENV_CONTENT: ${{ secrets.APP_ENV }}
+        run: |
+          printf '%s\n' "$APP_ENV_CONTENT" \
+            | install -m 600 /dev/stdin "/opt/nuklaut/secrets/${REPO}.env"
+
+      # Writes the shared env file on every deploy that supplies SHARED_ENV. An
+      # empty secret leaves the existing file untouched.
+      - name: Write shared env file
+        env:
+          SHARED_ENV_CONTENT: ${{ secrets.SHARED_ENV }}
+        run: |
+          if [ -z "$SHARED_ENV_CONTENT" ]; then
+            echo "SHARED_ENV not provided, leaving _shared.env as is"
+            exit 0
+          fi
+          printf '%s\n' "$SHARED_ENV_CONTENT" \
+            | install -m 600 /dev/stdin /opt/nuklaut/secrets/_shared.env
+
+      # --repo-path skips nuk's internal git clone, so private repos work
+      # without auth on the host (the checkout already exists in the workspace).
+      - name: Apply manifest
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          /usr/local/bin/nuk apply \
+            --repo-path "$GITHUB_WORKSPACE" \
+            "$MANIFEST"
+
+      - name: Show deployment state
+        run: /usr/local/bin/nuk list
+
+  # ── PREVIEW: deploy ────────────────────────────────────────────────────────
+  preview-deploy:
+    if: inputs.mode == 'preview' && inputs.preview_action == 'deploy'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Runner image marker
+        run: |
+          if [ -r /etc/bcx-runner-image ]; then
+            echo "bcx-runner-image: $(cat /etc/bcx-runner-image)"
+          else
+            echo "bcx-runner-image: none"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate inputs
+        env:
+          PR: ${{ inputs.pr_number }}
+          APP: ${{ inputs.app }}
+          BASE_HOST: ${{ inputs.base_host }}
+          COMPOSE_FILE: ${{ inputs.preview_compose_file }}
+        run: |
+          [ -n "$PR" ] || { echo "::error::pr_number is required for preview deploy"; exit 1; }
+          [ -n "$APP" ] || { echo "::error::app is required for preview deploy"; exit 1; }
+          [ -n "$BASE_HOST" ] || { echo "::error::base_host is required for preview deploy"; exit 1; }
+          test -f "$COMPOSE_FILE" \
+            || { echo "::error::preview_compose_file $COMPOSE_FILE not found in repo"; exit 1; }
+
+      # Enforce the cap: count the existing `<app>-pr-` deployments from `nuk
+      # list` (first whitespace-delimited token is the deployment name). This
+      # PR's own name is excluded so a re-deploy of a live preview never trips it.
+      - name: Check preview cap
+        id: cap
+        env:
+          APP: ${{ inputs.app }}
+          PR: ${{ inputs.pr_number }}
+          MAX: ${{ inputs.max_previews }}
+        run: |
+          NAME="${APP}-pr-${PR}"
+          OTHERS="$(/usr/local/bin/nuk list \
+            | awk -v p="${APP}-pr-" -v self="$NAME" '$1 ~ "^"p && $1 != self {print $1}')"
+          COUNT=0
+          [ -n "$OTHERS" ] && COUNT=$(printf '%s\n' "$OTHERS" | grep -c .)
+          EXISTS=false
+          if /usr/local/bin/nuk list | awk '{print $1}' | grep -qx "$NAME"; then
+            EXISTS=true
+          fi
+          AT_LIMIT=false
+          if [ "$EXISTS" != "true" ] && [ "$COUNT" -ge "$MAX" ]; then
+            AT_LIMIT=true
+            echo "::warning::Preview cap reached ($COUNT/$MAX), skipping deploy of $NAME"
+          else
+            echo "Capacity ok: $COUNT/$MAX other previews live (this PR exists=$EXISTS)."
+          fi
+          {
+            echo "name=$NAME"
+            echo "count=$COUNT"
+            echo "exists=$EXISTS"
+            echo "at_limit=$AT_LIMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      # Sticky "limit reached" comment; the run does not fail.
+      - name: Comment, limit reached
+        if: steps.cap.outputs.at_limit == 'true' && inputs.comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ inputs.pr_number }}
+          MAX: ${{ inputs.max_previews }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR, 10);
+            const marker = '<!-- nuk-preview -->';
+            const body = `${marker}\n### Preview Environment\n\n`
+              + `> **Preview skipped**: max concurrent previews (${process.env.MAX}) reached. `
+              + `Close another PR's preview first.`;
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: prNumber,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: prNumber, body });
+            }
+
+      # Login and pull as the RUNNER (no sudo) so private pr-<n> images land in
+      # the shared daemon, same pattern as mode apply.
+      - name: Pull pr-<n> images into the shared docker daemon
+        if: steps.cap.outputs.at_limit != 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          IMAGES: ${{ inputs.images }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          # IMAGES is a JSON object {service: "ghcr.io/.../image"}; pull each at :pr-<n>.
+          mapfile -t REFS < <(printf '%s' "$IMAGES" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('\n'.join(d.values()))")
+          for ref in "${REFS[@]}"; do
+            [ -n "$ref" ] || continue
+            echo "Pulling ${ref}:pr-${PR}"
+            docker pull "${ref}:pr-${PR}"
+          done
+
+      # Compose substitutes ${BACKEND_TAG}/${FRONTEND_TAG} etc. from a `.env` in
+      # the project dir. `nuk apply --repo-path` rsyncs $GITHUB_WORKSPACE into
+      # repo/, so a `.env` written here is auto-loaded by compose for the right
+      # pr-<n> tag.
+      - name: Write preview .env (image tag pin)
+        if: steps.cap.outputs.at_limit != 'true'
+        env:
+          PR: ${{ inputs.pr_number }}
+          BASE_HOST: ${{ inputs.base_host }}
+        run: |
+          {
+            echo "PR_NUMBER=${PR}"
+            echo "BACKEND_TAG=pr-${PR}"
+            echo "FRONTEND_TAG=pr-${PR}"
+            echo "PREVIEW_HOST=pr-${PR}.${BASE_HOST}"
+          } > .env
+
+      # Render the per-PR nuk manifest, either from a caller template (token
+      # substitution) or inline: /api -> backend (stripPrefix), / -> frontend,
+      # with a higher priority on /api so it wins over the catch-all.
+      - name: Render nuk manifest
+        if: steps.cap.outputs.at_limit != 'true'
+        id: manifest
+        env:
+          NAME: ${{ steps.cap.outputs.name }}
+          PR: ${{ inputs.pr_number }}
+          BASE_HOST: ${{ inputs.base_host }}
+          COMPOSE_FILE: ${{ inputs.preview_compose_file }}
+          TEMPLATE: ${{ inputs.manifest_template }}
+          BSVC: ${{ inputs.backend_service }}
+          BPORT: ${{ inputs.backend_port }}
+          FSVC: ${{ inputs.frontend_service }}
+          FPORT: ${{ inputs.frontend_port }}
+        run: |
+          HOST="pr-${PR}.${BASE_HOST}"
+          OUT=".nuklaut-preview.yml"
+          if [ -n "$TEMPLATE" ]; then
+            test -f "$TEMPLATE" || { echo "::error::manifest_template $TEMPLATE not found"; exit 1; }
+            sed -e "s|__NAME__|${NAME}|g" \
+                -e "s|__HOST__|${HOST}|g" \
+                -e "s|__COMPOSE_FILE__|${COMPOSE_FILE}|g" \
+                "$TEMPLATE" > "$OUT"
+          else
+            # Generate via PyYAML (the parser nuk uses) so types and indentation
+            # are right: port is int, stripPrefix is bool, /api outranks /.
+            NAME="$NAME" HOST="$HOST" COMPOSE_FILE="$COMPOSE_FILE" \
+            BSVC="$BSVC" BPORT="$BPORT" FSVC="$FSVC" FPORT="$FPORT" \
+            python3 - "$OUT" <<'PY'
+          import os, sys, yaml
+          doc = {
+              "apiVersion": "nuk/v1",
+              "kind": "Deployment",
+              "metadata": {"name": os.environ["NAME"]},
+              "spec": {
+                  "compose": {"file": os.environ["COMPOSE_FILE"]},
+                  "ingress": [
+                      {"host": os.environ["HOST"], "path": "/api",
+                       "stripPrefix": True, "priority": 100,
+                       "service": os.environ["BSVC"], "port": int(os.environ["BPORT"])},
+                      {"host": os.environ["HOST"], "priority": 10,
+                       "service": os.environ["FSVC"], "port": int(os.environ["FPORT"])},
+                  ],
+              },
+          }
+          with open(sys.argv[1], "w") as f:
+              yaml.safe_dump(doc, f, sort_keys=False)
+          PY
+          fi
+          {
+            echo "path=$OUT"
+            echo "host=$HOST"
+          } >> "$GITHUB_OUTPUT"
+          echo "--- rendered manifest ---"
+          cat "$OUT"
+
+      - name: nuk apply
+        if: steps.cap.outputs.at_limit != 'true'
+        env:
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          /usr/local/bin/nuk apply \
+            --repo-path "$GITHUB_WORKSPACE" \
+            "$MANIFEST"
+
+      - name: Show deployment state
+        if: steps.cap.outputs.at_limit != 'true'
+        run: /usr/local/bin/nuk list
+
+      # Sticky PR comment with the live URL (marker-delimited upsert).
+      - name: Comment, preview URL
+        if: steps.cap.outputs.at_limit != 'true' && inputs.comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ inputs.pr_number }}
+          HOST: ${{ steps.manifest.outputs.host }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          EXTRA: ${{ inputs.comment_extra }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR, 10);
+            const url = `https://${process.env.HOST}`;
+            const sha = (process.env.SHA || '').substring(0, 7);
+            const marker = '<!-- nuk-preview -->';
+            const lines = [
+              marker,
+              '### Preview Environment',
+              '',
+              '| | |',
+              '|---|---|',
+              `| **URL** | [${url}](${url}) |`,
+              `| **SHA** | \`${sha}\` |`,
+            ];
+            if (process.env.EXTRA) lines.push('', process.env.EXTRA);
+            const body = lines.join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: prNumber,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: prNumber, body });
+            }
+
+  # ── PREVIEW: teardown (PR closed or merged) ────────────────────────────────
+  preview-teardown:
+    if: inputs.mode == 'preview' && inputs.preview_action == 'teardown'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Runner image marker
+        run: |
+          if [ -r /etc/bcx-runner-image ]; then
+            echo "bcx-runner-image: $(cat /etc/bcx-runner-image)"
+          else
+            echo "bcx-runner-image: none"
+          fi
+
+      - name: Validate inputs
+        env:
+          PR: ${{ inputs.pr_number }}
+          APP: ${{ inputs.app }}
+        run: |
+          [ -n "$PR" ] || { echo "::error::pr_number is required for preview teardown"; exit 1; }
+          [ -n "$APP" ] || { echo "::error::app is required for preview teardown"; exit 1; }
+
+      # delete: compose down -v, remove the Traefik dynamic file, rmtree the project.
+      - name: nuk delete
+        env:
+          APP: ${{ inputs.app }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          NAME="${APP}-pr-${PR}"
+          echo "Tearing down $NAME"
+          /usr/local/bin/nuk delete "$NAME"
+          /usr/local/bin/nuk list
+
+      - name: Comment, torn down
+        if: inputs.comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ inputs.pr_number }}
+          MERGED: ${{ github.event.pull_request.merged }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR, 10);
+            const action = process.env.MERGED === 'true' ? 'Merged' : 'Closed';
+            const marker = '<!-- nuk-preview -->';
+            const body = `${marker}\n### Preview Environment\n\n${action}: preview torn down.`;
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: prNumber,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            }
+
+  # ── PREVIEW: cleanup (cron sweep) ──────────────────────────────────────────
+  preview-cleanup:
+    if: inputs.mode == 'preview' && inputs.preview_action == 'cleanup'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Runner image marker
+        run: |
+          if [ -r /etc/bcx-runner-image ]; then
+            echo "bcx-runner-image: $(cat /etc/bcx-runner-image)"
+          else
+            echo "bcx-runner-image: none"
+          fi
+
+      # For each `<app>-pr-<n>` deployment, map back to PR <n>, query its state
+      # and delete every preview whose PR is not OPEN.
+      - name: Sweep stale previews
+        env:
+          APP: ${{ inputs.app }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          [ -n "$APP" ] || { echo "::error::app is required for preview cleanup"; exit 1; }
+          STALE=0
+          mapfile -t NAMES < <(/usr/local/bin/nuk list \
+            | awk -v p="${APP}-pr-" '$1 ~ "^"p"[0-9]+$" {print $1}')
+          for name in "${NAMES[@]}"; do
+            PR_NUM="${name#"${APP}-pr-"}"
+            STATE="$(gh pr view "$PR_NUM" --repo "$GH_REPO" --json state -q '.state' 2>/dev/null || echo UNKNOWN)"
+            if [ "$STATE" != "OPEN" ]; then
+              echo "PR #${PR_NUM} is ${STATE}, deleting stale preview ${name}"
+              /usr/local/bin/nuk delete "$name"
+              STALE=$((STALE + 1))
+            else
+              echo "PR #${PR_NUM} OPEN, keeping ${name}"
+            fi
+          done
+          echo "Cleaned up ${STALE} stale preview(s)."
